@@ -1,0 +1,198 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAMES: "aw-kimai-bridge aw-kimai-admin"
+
+jobs:
+  build:
+    name: Build — ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux x86-64 ───────────────────────────────────────────────
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: false
+            archive_ext: tar.gz
+
+          # ── Linux ARM64 ────────────────────────────────────────────────
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+            archive_ext: tar.gz
+
+          # ── macOS x86-64 ───────────────────────────────────────────────
+          - name: macos-amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+            archive_ext: tar.gz
+
+          # ── macOS ARM64 (Apple Silicon) ────────────────────────────────
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+            archive_ext: tar.gz
+
+          # ── Windows x86-64 ─────────────────────────────────────────────
+          - name: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            archive_ext: zip
+
+          # ── Windows ARM64 ──────────────────────────────────────────────
+          - name: windows-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            cross: false
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Rust toolchain ─────────────────────────────────────────────────
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ── Rust build cache ───────────────────────────────────────────────
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # ── Linux: musl toolchain for static binaries ──────────────────────
+      - name: Install musl-tools (Linux AMD64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # ── Linux ARM64: use `cross` for cross-compilation ─────────────────
+      - name: Install cross (Linux ARM64)
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # ── Build ──────────────────────────────────────────────────────────
+      - name: Build (native)
+        if: matrix.cross == false
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      # ── Run tests (only on native targets) ────────────────────────────
+      - name: Run tests
+        if: matrix.cross == false && !startsWith(matrix.target, 'aarch64-apple') && !startsWith(matrix.target, 'aarch64-pc-windows')
+        run: cargo test --release --target ${{ matrix.target }}
+
+      # ── Stage binaries (Unix) ──────────────────────────────────────────
+      - name: Stage binaries (Unix)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          STAGE="stage/${{ matrix.name }}"
+          mkdir -p "$STAGE"
+          for bin in $BINARY_NAMES; do
+            cp "target/${{ matrix.target }}/release/${bin}" "$STAGE/"
+          done
+          cp README.md "$STAGE/" 2>/dev/null || true
+          cp config.example.toml "$STAGE/" 2>/dev/null || true
+          cp bootstrap.example.toml "$STAGE/" 2>/dev/null || true
+
+      # ── Stage binaries (Windows) ───────────────────────────────────────
+      - name: Stage binaries (Windows)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $stage = "stage\${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($bin in "$env:BINARY_NAMES".Split(" ")) {
+            Copy-Item "target\${{ matrix.target }}\release\${bin}.exe" $stage\
+          }
+          if (Test-Path "README.md")               { Copy-Item README.md $stage\ }
+          if (Test-Path "config.example.toml")     { Copy-Item config.example.toml $stage\ }
+          if (Test-Path "bootstrap.example.toml")  { Copy-Item bootstrap.example.toml $stage\ }
+
+      # ── Pack archive (tar.gz) ──────────────────────────────────────────
+      - name: Pack tar.gz
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          ARCHIVE="aw-kimai-bridge-${{ matrix.name }}.tar.gz"
+          tar -czf "$ARCHIVE" -C stage "${{ matrix.name }}"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      # ── Pack archive (zip) ─────────────────────────────────────────────
+      - name: Pack zip
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $archive = "aw-kimai-bridge-${{ matrix.name }}.zip"
+          Compress-Archive -Path "stage\${{ matrix.name }}\*" -DestinationPath $archive
+          "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ── Upload build artifact (for every build, useful on PRs) ────────
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aw-kimai-bridge-${{ matrix.name }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 7
+
+  # ── Create GitHub Release and attach archives ──────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only run on version tags, not on PRs
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Merge all artifact directories into dist/
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "aw-kimai-bridge ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt

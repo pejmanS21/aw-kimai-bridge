@@ -1,0 +1,66 @@
+# ── aw-kimai-bridge config ────────────────────────────────────────────────────
+# Copy this file to config.toml and edit before first run.
+
+[kimai]
+url                = "https://kimai.yourcompany.com"
+token              = "YOUR_KIMAI_API_TOKEN"
+default_project_id = 1      # fallback project when no rule matches
+default_activity_id = 1     # fallback activity ID
+# user_id = 5               # optional: assign entries to a specific user
+
+[activitywatch]
+url    = "http://localhost:5600"
+bucket = "aw-watcher-window_YOURHOSTNAME"
+
+# How often (seconds) the daemon wakes and syncs. 300 = every 5 minutes.
+sync_interval_secs = 300
+
+# Gaps shorter than this (seconds) between same-project events are merged.
+# Handles brief alt-tabs, switching to Slack and back, etc.
+idle_threshold_secs = 120
+
+# Blocks shorter than this (seconds) after merging are discarded.
+min_duration_secs = 60
+
+# Where to persist the sync cursor between restarts.
+state_path = "~/.local/share/aw-kimai-bridge/state.json"
+
+# ── Classification rules ──────────────────────────────────────────────────────
+# Matched against: window title + app name + URL (case-insensitive, first match wins)
+# Set project_id = 0 to explicitly IGNORE matching events.
+
+[[rules]]
+pattern    = "github\\.com/yourorg/project-alpha"
+project_id = 42
+activity_id = 7
+label      = "Project Alpha (GitHub)"
+
+[[rules]]
+pattern    = "PROJ-\\d+"           # JIRA tickets e.g. PROJ-123
+project_id = 43
+activity_id = 8
+label      = "Project Beta (JIRA)"
+
+[[rules]]
+pattern    = "VS Code|code\\.exe"
+project_id = 42
+activity_id = 9
+label      = "Dev work (VS Code catch-all)"
+
+[[rules]]
+pattern    = "Figma|design\\.yourcompany\\.com"
+project_id = 44
+activity_id = 10
+label      = "Design"
+
+[[rules]]
+pattern    = "YouTube|Netflix|Twitch|reddit\\.com"
+project_id = 0              # ignored — don't log entertainment time
+activity_id = 0
+label      = "Entertainment (ignored)"
+
+[[rules]]
+pattern    = "Slack|Teams|Discord|Zoom|Meet"
+project_id = 1
+activity_id = 2
+label      = "Internal comms"
