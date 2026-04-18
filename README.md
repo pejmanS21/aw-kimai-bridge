@@ -11,6 +11,7 @@ Also ships `aw-kimai-admin`, a companion CLI for managing Kimai customers, proje
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Setup](./aw_kimai_bridge_setup_guide_styled.md)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
   - [Kimai](#kimai)
