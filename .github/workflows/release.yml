@@ -11,6 +11,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAMES: "aw-kimai-bridge aw-kimai-admin"
+  # reqwest is built with rustls-tls so no OpenSSL is needed on any platform.
 
 jobs:
   build:
@@ -20,14 +21,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux x86-64 ───────────────────────────────────────────────
+          # ── Linux x86-64 (static musl) ─────────────────────────────────
           - name: linux-amd64
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: false
             archive_ext: tar.gz
 
-          # ── Linux ARM64 ────────────────────────────────────────────────
+          # ── Linux ARM64 (static musl, cross-compiled) ──────────────────
           - name: linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
@@ -78,12 +79,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # ── Linux: musl toolchain for static binaries ──────────────────────
+      # ── Linux x86-64: install musl-tools for the C musl toolchain ─────
+      # No OpenSSL needed — reqwest uses rustls which is pure Rust.
       - name: Install musl-tools (Linux AMD64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # ── Linux ARM64: use `cross` for cross-compilation ─────────────────
+      # ── Linux ARM64: cross handles the full musl sysroot via Docker ───
       - name: Install cross (Linux ARM64)
         if: matrix.cross == true
         uses: taiki-e/install-action@v2
@@ -99,9 +101,12 @@ jobs:
         if: matrix.cross == true
         run: cross build --release --target ${{ matrix.target }}
 
-      # ── Run tests (only on native targets) ────────────────────────────
+      # ── Tests (skip cross-compiled targets — can't run foreign binaries) ──
       - name: Run tests
-        if: matrix.cross == false && !startsWith(matrix.target, 'aarch64-apple') && !startsWith(matrix.target, 'aarch64-pc-windows')
+        if: |
+          matrix.cross == false &&
+          matrix.target != 'aarch64-apple-darwin' &&
+          matrix.target != 'aarch64-pc-windows-msvc'
         run: cargo test --release --target ${{ matrix.target }}
 
       # ── Stage binaries (Unix) ──────────────────────────────────────────
@@ -150,7 +155,7 @@ jobs:
           Compress-Archive -Path "stage\${{ matrix.name }}\*" -DestinationPath $archive
           "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # ── Upload build artifact (for every build, useful on PRs) ────────
+      # ── Upload build artifact ──────────────────────────────────────────
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -158,12 +163,11 @@ jobs:
           path: ${{ env.ARCHIVE }}
           retention-days: 7
 
-  # ── Create GitHub Release and attach archives ──────────────────────────
+  # ── Create GitHub Release ──────────────────────────────────────────────
   release:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    # Only run on version tags, not on PRs
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -176,7 +180,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
-          # Merge all artifact directories into dist/
           merge-multiple: true
 
       - name: Generate checksums

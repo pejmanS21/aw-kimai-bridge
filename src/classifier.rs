@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn matches_window_title() {
-        let c = make_classifier(vec![("github\\.com/myorg", 10, 2)]);
+        let c = make_classifier(vec![("myorg/project-", 10, 2)]);
         let ev = make_event("myorg/project-alpha - GitHub", "Firefox", None);
         let result = c.classify(&ev).unwrap();
         assert_eq!(result.project_id, 10);
