@@ -3,14 +3,21 @@
 
 [kimai]
 url                = "https://kimai.yourcompany.com"
+# Prefer setting the KIMAI_TOKEN environment variable instead of putting the
+# token in this file. If both are set, the env var wins. If you do paste it
+# below, treat config.toml like a secret (chmod 600, don't commit, etc).
 token              = "YOUR_KIMAI_API_TOKEN"
 default_project_id = 1      # fallback project when no rule matches
 default_activity_id = 1     # fallback activity ID
 # user_id = 5               # optional: assign entries to a specific user
 
 [activitywatch]
-url    = "http://localhost:5600"
-bucket = "aw-watcher-window_YOURHOSTNAME"
+url        = "http://localhost:5600"
+bucket     = "aw-watcher-window_YOURHOSTNAME"
+# AFK bucket — when set, window events that overlap AFK intervals get clipped
+# so time spent away from the keyboard is never billed to Kimai. Strongly
+# recommended; the daemon will warn at startup if you leave this empty.
+afk_bucket = "aw-watcher-afk_YOURHOSTNAME"
 
 # How often (seconds) the daemon wakes and syncs. 300 = every 5 minutes.
 sync_interval_secs = 300

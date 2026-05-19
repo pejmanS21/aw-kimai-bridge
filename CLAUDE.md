@@ -4,132 +4,128 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Rust daemon that syncs ActivityWatch window-tracking events into Kimai timesheet entries. It classifies window events by regex rules, merges adjacent events into contiguous time blocks, and pushes them to Kimai via API.
+A Rust daemon that syncs ActivityWatch window-tracking events into Kimai timesheet entries. Pulls window events from a local ActivityWatch instance, subtracts AFK periods, classifies events by regex rules, merges adjacent events into contiguous time blocks, and pushes them to Kimai via API.
 
 Two binaries are built:
-- **aw-kimai-bridge**: The main daemon that runs continuously, syncing on a schedule
-- **aw-kimai-admin**: A CLI tool for managing Kimai customers, projects, and activities
+- **aw-kimai-bridge**: the sync daemon. Also installs/uninstalls itself as a per-user OS service.
+- **aw-kimai-admin**: a CLI for managing Kimai customers/projects/activities and for the first-run setup wizard.
 
 ## Common Commands
 
 ```bash
-# Build debug binaries
+# Build / test / lint
 cargo build
-
-# Build release binaries
 cargo build --release
-
-# Run tests
 cargo test
+cargo test merger::tests::merges_adjacent_same_project   # run a single test
+cargo clippy --all-targets                                # required before PRs
 
-# Run linting (required before PRs)
-cargo clippy
+# Daemon — note the clap subcommands
+cargo run --bin aw-kimai-bridge -- run config.toml
+cargo run --bin aw-kimai-bridge -- install-service config.toml
+cargo run --bin aw-kimai-bridge -- uninstall-service
+cargo run --bin aw-kimai-bridge -- service-status
 
-# Run the daemon (requires config.toml)
-cargo run --bin aw-kimai-bridge -- config.toml
-
-# Run the admin CLI
+# Admin CLI
+cargo run --bin aw-kimai-admin -- setup                   # interactive wizard
+cargo run --bin aw-kimai-admin -- bootstrap init-blueprint acme.toml
 cargo run --bin aw-kimai-admin -- --help
 
-# Generate a bootstrap blueprint template
-cargo run --bin aw-kimai-admin -- bootstrap init-blueprint acme.toml
-
-# Run with debug logging
-RUST_LOG=debug cargo run --bin aw-kimai-bridge -- config.toml
+# Debug logging
+RUST_LOG=debug cargo run --bin aw-kimai-bridge -- run config.toml
 ```
+
+`aw-kimai-bridge` with no args defaults to `run config.toml`. The bare positional path form (`aw-kimai-bridge config.toml`) was removed when subcommands were added — call sites and docs must use `run` explicitly.
 
 ## Architecture
 
-### Data Flow (Daemon)
+### Data flow (daemon, one cycle)
 
 ```
-ActivityWatch ──► aw_client ──► classifier ──► merger ──► kimai_client ──► Kimai
-                                 (regex)       (merge      (timesheet
-                                  rules        blocks)      entries)
+ActivityWatch ──► aw_client ──► afk::clip_events ──► classifier ──► merger ──► kimai_client ──► Kimai
+                  (window +     (subtract AFK         (regex rules,    (merge blocks,     (timesheet
+                   AFK buckets)  intervals from        first match     drop short        entries)
+                                 window events)        wins)            blocks)
 ```
 
-Each sync cycle:
-1. **aw_client.rs**: Fetches raw window events from ActivityWatch HTTP API (`/api/0/buckets/{id}/events`)
-2. **classifier.rs**: Matches events against ordered regex rules (first match wins). `project_id = 0` means ignore
-3. **merger.rs**: Merges adjacent same-project events if gap < `idle_threshold_secs`, drops blocks shorter than `min_duration_secs`
-4. **kimai_client.rs**: POSTs merged TimeBlocks to Kimai `/api/timesheets`
-5. **state.rs**: Atomically writes sync cursor to `state.json` (last_synced_at)
+Steps per `sync_once` in [src/main.rs](src/main.rs):
+1. **Fetch window events** from `[activitywatch].bucket` since `state.last_synced_at`.
+2. **Fetch AFK events** from `[activitywatch].afk_bucket` (when configured) with a 24h lookback so a long AFK window that began before the cursor still clips correctly.
+3. **Clip** ([src/afk.rs](src/afk.rs)) — `intervals_from_events` merges AFK intervals; `clip_events` subtracts them from each window event, splitting events that straddle AFK and dropping events fully covered by AFK. Fragments shorter than 1s are discarded as noise. When `afk_bucket` is unset the daemon warns at startup and skips this step.
+4. **Classify** ([src/classifier.rs](src/classifier.rs)) — first match wins against a haystack of `title\napp\nurl`. `project_id = 0` is the explicit "ignore this event" sentinel.
+5. **Merge** ([src/merger.rs](src/merger.rs)) — same-project events with gaps ≤ `idle_threshold_secs` collapse into one `TimeBlock`. Blocks shorter than `min_duration_secs` are dropped.
+6. **Push** ([src/kimai_client.rs](src/kimai_client.rs)) — `push_batch` returns `Vec<Result<TimesheetEntry>>` (one per block, in order).
+7. **Advance cursor** — to `until` on full success, or to the first failed block's `start` on partial failure so the failed block (and anything after) gets retried. Previously failures were silently dropped; do not regress.
 
-### Module Structure
+### Module structure
 
-**Daemon (src/main.rs)**:
-- `config.rs`: TOML config with `[kimai]`, `[activitywatch]`, `[[rules]]` sections
-- `aw_client.rs`: HTTP client for ActivityWatch API; fetches bucket events
-- `kimai_client.rs`: HTTP client for Kimai API; pushes timesheet entries
-- `classifier.rs`: Compiles regex rules, classifies `AwEvent` → `ClassifiedEvent`
-- `merger.rs`: Merges `ClassifiedEvent` list → `Vec<TimeBlock>`
-- `state.rs`: JSON persistence for sync cursor with atomic write-then-rename
+**Daemon (`src/`)**:
+- `main.rs` — clap CLI (`run` / `install-service` / `uninstall-service` / `service-status`); `sync_once` orchestrates the cycle.
+- `config.rs` — TOML config. **`KIMAI_TOKEN` env var always overrides `kimai.token` in the file.** Both binaries enforce this; the admin CLI's `config.rs` mirrors the precedence.
+- `aw_client.rs` — HTTP client for AW. Separate `get_events` (window) and `get_afk_events` paths because the `data` payloads have different shapes.
+- `afk.rs` — pure functions: `intervals_from_events` (sorted, merged) and `clip_events` (splits/drops window events against AFK intervals). Heavily unit-tested; new AFK-related logic belongs here, not in main or the merger.
+- `classifier.rs` — compiles regexes at startup (`Config::validate` pre-checks them so we fail fast).
+- `merger.rs` — `BlockBuilder` accumulates `(title, app, url) → seconds` per block; `build_description` sorts by contributed time, takes the top `MAX_DETAILS_SHOWN = 5`, formats `"title [app] <url> | … (+N more)"`, and `truncate(_, 255)` happens at push time. The first window title is no longer the description — preserve this multi-event aggregation when changing the merger.
+- `kimai_client.rs` — POST `/api/timesheets`. **Timestamps must include a tz offset (`%Y-%m-%dT%H:%M:%S%:z`)** — without it Kimai interprets them as server-local and silently shifts entries by the local offset. Same applies to the `begin=` query on `list_recent_entries`.
+- `service.rs` — per-user auto-start installer. macOS = launchd plist at `~/Library/LaunchAgents`, Linux = systemd `--user` unit at `~/.config/systemd/user`, Windows = `.cmd` shim in the Startup folder. Each `platform` submodule is `#[cfg(target_os = …)]`-gated; a no-op fallback covers other OSes so the build never fails. No admin rights required.
+- `state.rs` — sync cursor persisted via write-then-rename. Delete the file to force a full re-sync.
 
-**Admin CLI (src/bin/admin/)**:
-- `main.rs`: clap CLI with customer/project/activity/bootstrap subcommands
-- `kimai_admin/mod.rs`: `KimaiAdminClient` for Kimai entity management APIs
-- `kimai_admin/bootstrap.rs`: Interactive wizard + idempotent blueprint application
-- `config.rs`: Subset of daemon config (only `[kimai]` section needed)
-- `output.rs`: Table and JSON formatting for CLI output
-- `setup.rs`: Interactive first-run configuration wizard
+**Admin CLI (`src/bin/admin/`)**:
+- `main.rs` — clap subcommands for customer/project/activity CRUD + `bootstrap` + `setup`. `setup` is special-cased before `Config::load` because it *creates* the config.
+- `setup.rs` — 4-step wizard. Calls `GET /api/0/buckets/` to auto-discover window + AFK buckets (uses `reqwest::blocking`, hence the `blocking` feature on reqwest); falls back to hostname-based guesses when AW isn't reachable. Lets the user leave the token blank to defer to `KIMAI_TOKEN`. Ends by printing the `install-service` command.
+- `kimai_admin/mod.rs` — `KimaiAdminClient` (separate from the daemon's `KimaiClient` because the admin surface is much wider).
+- `kimai_admin/bootstrap.rs` — idempotent customer/project/activity scaffolding from a TOML blueprint or interactive prompts.
 
-### Key Types
+### Key types
 
-- `AwEvent`: Raw ActivityWatch event with timestamp, duration, title, app, optional URL
-- `ClassifiedEvent`: AwEvent + project_id/activity_id/label from rule matching
-- `TimeBlock`: Merged contiguous work block with start/end/project/activity/description
-- `State`: Persisted cursor with last_synced_at, total_entries_pushed, daemon_started_at
+- `AwEvent` / `AwEventData` — raw window event with `title`, `app`, `url`.
+- `AfkEvent` / `AfkEventData` — raw AFK event with `status` (`"afk"` / `"not-afk"`). `is_afk()` is the canonical predicate.
+- `ClassifiedEvent` — `AwEvent` + assigned `project_id` / `activity_id` / `label`.
+- `TimeBlock` — merged block with aggregated description.
+- `State` — `last_synced_at`, `total_entries_pushed`, `daemon_started_at`.
 
 ### Configuration
 
-Rules are evaluated top-to-bottom; first match wins. Patterns match against "title\napp\nurl" combined string (case-insensitive).
-
 ```toml
 [kimai]
-url = "https://kimai.example.com"
-token = "ki_..."
+url                = "https://kimai.example.com"
+# token is read from KIMAI_TOKEN env var if set; otherwise from here
+token              = "ki_..."
 default_project_id = 1
 default_activity_id = 1
 
 [activitywatch]
-bucket = "aw-watcher-window_hostname"
+url        = "http://localhost:5600"
+bucket     = "aw-watcher-window_HOSTNAME"
+afk_bucket = "aw-watcher-afk_HOSTNAME"   # optional but strongly recommended
 
-sync_interval_secs = 300
-idle_threshold_secs = 120  # merge gaps under 2 min
-min_duration_secs = 60     # drop blocks under 1 min
+sync_interval_secs  = 300
+idle_threshold_secs = 120
+min_duration_secs   = 60
 
 [[rules]]
-pattern = "github\.com/myorg"
+pattern    = "github\.com/myorg"   # case-insensitive regex against title\napp\nurl
 project_id = 10
 activity_id = 2
-label = "MyOrg Work"
-
-[[rules]]
-pattern = "YouTube|Reddit"
-project_id = 0  # ignore
+label      = "MyOrg Work"
 ```
 
 ## Testing
 
-Unit tests are embedded in source files under `#[cfg(test)]`. Key test areas:
-- `classifier.rs`: Tests rule matching, URL matching, ignore rules, fall-through to default
-- `merger.rs`: Tests merging adjacent events, splitting on project changes, dropping short blocks
+Unit tests live in source files under `#[cfg(test)]`. Coverage worth knowing about:
+- `afk.rs` — clip/split/drop and interval merging.
+- `merger.rs` — adjacency merging, splits, short-block drops, **and description-shape assertions** (don't change description formatting without updating those).
+- `classifier.rs` — rule matching, URL matching, ignore rules, fall-through.
+
+`aw_client.rs` and `kimai_client.rs` are HTTP boundaries with no unit tests.
 
 ## CI/CD
 
-GitHub Actions workflow (`.github/workflows/release.yml`):
-- Builds for Linux x86-64/ARM64, macOS x86-64/ARM64, Windows x86-64/ARM64
-- Cross-compilation uses `cross` for Linux ARM64
-- Tests run on native targets
-- Creates release archives on version tags (`v*`)
+`.github/workflows/release.yml` builds Linux/macOS/Windows x86-64 and ARM64. Linux ARM64 uses `cross`; everything else builds natively. Tests run on native targets only. Tags matching `v*` produce release archives.
 
-## State Management
+## Conventions
 
-The daemon writes `state.json` atomically (write to `.json.tmp`, then rename) after each successful sync cycle. The `last_synced_at` timestamp is the cursor for the next ActivityWatch query. To force a full re-sync, delete `state.json`.
-
-## Logging
-
-Uses `tracing` with `RUST_LOG` environment variable:
-- `RUST_LOG=info`: Sync summaries only
-- `RUST_LOG=debug`: Per-event classification and merge details
-- `RUST_LOG=trace`: Individual rule match logging
+- **TLS**: `reqwest` is configured `default-features = false, features = ["json", "rustls-tls", "blocking"]` so we have no OpenSSL dependency and can build fully static musl binaries. Don't reintroduce `native-tls`.
+- **Time**: everything internal is `chrono::DateTime<Utc>`. Only the Kimai POST formatter touches timezone strings — and it must keep the `%:z` suffix.
+- **Logging**: `tracing` with `RUST_LOG`. `info` = sync summaries, `debug` = per-event detail, `trace` = individual rule matches.
+- **State**: never advance the cursor past a known failure. The current logic in `main.rs` is load-bearing — if you refactor `push_batch`, keep per-block result ordering so the "first failure timestamp" calculation still works.
