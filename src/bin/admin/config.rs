@@ -14,6 +14,7 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct KimaiConfig {
     pub url: String,
+    #[serde(default)]
     pub token: String,
 }
 
@@ -22,7 +23,23 @@ impl Config {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("Config not found: {}", path.display()))?;
-        toml::from_str(&raw)
-            .with_context(|| format!("Failed to parse config: {}", path.display()))
+        let mut config: Config = toml::from_str(&raw)
+            .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+
+        // Same precedence as the daemon: KIMAI_TOKEN env var beats the file.
+        if let Ok(env_token) = std::env::var("KIMAI_TOKEN") {
+            if !env_token.is_empty() {
+                config.kimai.token = env_token;
+            }
+        }
+
+        if config.kimai.token.is_empty() {
+            anyhow::bail!(
+                "kimai.token is empty — set it in {} or via the KIMAI_TOKEN env var",
+                path.display()
+            );
+        }
+
+        Ok(config)
     }
 }

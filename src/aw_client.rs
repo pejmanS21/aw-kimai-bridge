@@ -40,6 +40,32 @@ pub struct AwEventData {
     pub url: Option<String>,
 }
 
+/// One event from the AFK bucket (`aw-watcher-afk_<hostname>`).
+/// `status` is "afk" when the user has been idle past the AFK threshold,
+/// or "not-afk" when active. We only care about "afk" intervals — they
+/// mark stretches of time we must not bill to Kimai.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AfkEvent {
+    pub timestamp: DateTime<Utc>,
+    pub duration: f64,
+    pub data: AfkEventData,
+}
+
+impl AfkEvent {
+    pub fn end(&self) -> DateTime<Utc> {
+        self.timestamp + chrono::Duration::milliseconds((self.duration * 1000.0) as i64)
+    }
+
+    pub fn is_afk(&self) -> bool {
+        self.data.status.eq_ignore_ascii_case("afk")
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AfkEventData {
+    pub status: String,
+}
+
 /// Metadata for an ActivityWatch bucket.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -118,8 +144,54 @@ impl AwClient {
         Ok(events)
     }
 
+    /// Fetch AFK events from the watcher's AFK bucket in [start, end).
+    /// Same shape as `get_events` but deserializes the `data.status` field
+    /// instead of window title/app/url.
+    pub async fn get_afk_events(
+        &self,
+        bucket_id: &str,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<Vec<AfkEvent>> {
+        let url = format!("{}/api/0/buckets/{}/events", self.base_url, bucket_id);
+
+        let mut req = self.http.get(&url);
+        if let Some(start) = since {
+            req = req.query(&[("start", start.to_rfc3339())]);
+        }
+        if let Some(end) = until {
+            req = req.query(&[("end", end.to_rfc3339())]);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .context("Failed to reach ActivityWatch AFK bucket")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "ActivityWatch returned HTTP {status} for AFK bucket {bucket_id}: {body}"
+            );
+        }
+
+        let events: Vec<AfkEvent> = resp
+            .json()
+            .await
+            .context("Failed to deserialize AFK events")?;
+
+        tracing::debug!(
+            bucket = bucket_id,
+            count = events.len(),
+            "Fetched AFK events from ActivityWatch"
+        );
+
+        Ok(events)
+    }
+
     /// List all buckets registered with this ActivityWatch instance.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used by tests and reserved for future discovery features
     pub async fn list_buckets(&self) -> Result<Vec<AwBucket>> {
         let url = format!("{}/api/0/buckets/", self.base_url);
         let resp = self

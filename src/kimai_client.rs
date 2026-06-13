@@ -52,9 +52,12 @@ impl KimaiClient {
     pub async fn push_entry(&self, block: &TimeBlock) -> Result<TimesheetEntry> {
         let url = format!("{}/api/timesheets", self.base_url);
 
+        // ISO-8601 with explicit timezone offset. Without a tz suffix Kimai
+        // interprets the timestamp as the server's local time, which silently
+        // shifts entries by the offset between UTC and the server's tz.
         let body = CreateTimesheetRequest {
-            begin: block.start.format("%Y-%m-%dT%H:%M:%S").to_string(),
-            end: block.end.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            begin: block.start.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+            end: block.end.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
             project: block.project_id,
             activity: block.activity_id,
             description: truncate(&block.description, 255),
@@ -92,31 +95,28 @@ impl KimaiClient {
         Ok(entry)
     }
 
-    /// Push a batch of TimeBlocks, returning (success_count, Vec<errors>).
-    /// Errors are non-fatal — we log them and continue with the rest of the batch.
+    /// Push a batch of TimeBlocks, returning one Result per block in the same
+    /// order. Errors are non-fatal — callers decide what to do with the
+    /// per-block outcomes (e.g. advance the cursor only up to the first
+    /// failure so the rest get retried next cycle).
     pub async fn push_batch(
         &self,
         blocks: &[TimeBlock],
-    ) -> (usize, Vec<anyhow::Error>) {
-        let mut ok = 0usize;
-        let mut errors = vec![];
-
+    ) -> Vec<Result<TimesheetEntry>> {
+        let mut results = Vec::with_capacity(blocks.len());
         for block in blocks {
-            match self.push_entry(block).await {
-                Ok(_) => ok += 1,
-                Err(e) => {
-                    tracing::warn!(
-                        project = block.project_id,
-                        start = %block.start,
-                        error = %e,
-                        "Failed to push entry, will retry next cycle"
-                    );
-                    errors.push(e);
-                }
+            let r = self.push_entry(block).await;
+            if let Err(e) = &r {
+                tracing::warn!(
+                    project = block.project_id,
+                    start = %block.start,
+                    error = %e,
+                    "Failed to push entry, will retry next cycle"
+                );
             }
+            results.push(r);
         }
-
-        (ok, errors)
+        results
     }
 
     /// List recent timesheet entries for the configured user.
@@ -137,7 +137,7 @@ impl KimaiClient {
             .query(&[("size", limit.to_string())]);
 
         if let Some(start) = since {
-            req = req.query(&[("begin", start.format("%Y-%m-%dT%H:%M:%S").to_string())]);
+            req = req.query(&[("begin", start.format("%Y-%m-%dT%H:%M:%S%:z").to_string())]);
         }
 
         let resp = req.send().await.context("Failed to list Kimai entries")?;

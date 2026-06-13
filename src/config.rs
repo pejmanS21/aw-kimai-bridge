@@ -35,6 +35,9 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct KimaiConfig {
     pub url: String,
+    /// API token. May be overridden at runtime by the KIMAI_TOKEN env var,
+    /// which is the recommended way to keep secrets out of config.toml.
+    #[serde(default)]
     pub token: String,
     /// Fallback project ID when no rule matches
     pub default_project_id: u32,
@@ -50,6 +53,11 @@ pub struct ActivityWatchConfig {
     pub url: String,
     /// Name of the watcher bucket. Usually "aw-watcher-window_<hostname>".
     pub bucket: String,
+    /// AFK bucket name (e.g. "aw-watcher-afk_<hostname>"). When set, window
+    /// events that overlap AFK periods are clipped or dropped so we never
+    /// bill time the user was away from the keyboard.
+    #[serde(default)]
+    pub afk_bucket: Option<String>,
 }
 
 /// A single classification rule mapping window titles to a Kimai project.
@@ -92,8 +100,17 @@ impl Config {
         let path = path.as_ref();
         let raw = fs::read_to_string(path)
             .context(format!("Failed to read config file: {}. Run `aw-kimai-admin setup` to create one", path.display()))?;
-        let config: Config = toml::from_str(&raw)
+        let mut config: Config = toml::from_str(&raw)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        // KIMAI_TOKEN env var always wins over the file value so the secret
+        // can be supplied by systemd/launchd/keychain instead of plaintext.
+        if let Ok(env_token) = std::env::var("KIMAI_TOKEN") {
+            if !env_token.is_empty() {
+                config.kimai.token = env_token;
+            }
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -103,7 +120,9 @@ impl Config {
             anyhow::bail!("kimai.url must not be empty");
         }
         if self.kimai.token.is_empty() {
-            anyhow::bail!("kimai.token must not be empty");
+            anyhow::bail!(
+                "kimai.token is empty — set it in config.toml or via the KIMAI_TOKEN env var"
+            );
         }
         if self.activitywatch.bucket.is_empty() {
             anyhow::bail!("activitywatch.bucket must not be empty");
